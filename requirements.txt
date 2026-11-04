@@ -1,0 +1,9 @@
+torch
+torchvision
+scikit-learn
+numpy
+wandb
+pytest
+pandas
+matplotlib
+tqdm

@@ -1,0 +1,4 @@
+[BASIC]
+# Allow shape letters used for tensor dimensions:
+# B (batch), C (channels), H/W (height/width), N (tokens), D (embedding dim).
+good-names=i,j,k,_,B,C,H,W,N,D
