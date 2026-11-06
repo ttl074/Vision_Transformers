@@ -83,8 +83,11 @@ class PatchEmbedding(nn.Module):
     """
     def __init__(self, d_model, img_size, patch_size, n_channels):
         super().__init__()
+
+        # image size must be divisible by patch size
         if img_size % patch_size != 0:
             raise ValueError(f"{img_size} is not divisible by {patch_size}")
+
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
         self.linear_proj = nn.Linear(n_channels * patch_size * patch_size, d_model)
@@ -100,11 +103,17 @@ class PatchEmbedding(nn.Module):
             torch.Tensor: Tokens of shape (B, num_patches, d_model), one per
             patch in row-major order.
         """
+        # get image shape
         B, C, H, W = x.shape
         p = self.patch_size
+        # reshape to split spatial axis to get (which patch, position inside patch):
+        # (B, C, H/p, p, W/p, p)
         x = x.reshape(B, C, H // p, p, W // p, p)
+        # gather each patch's pixels together: (B, H/p, W/p, C, p, p)
         x = x.permute(0, 2, 4, 1, 3, 5)
+        # flatten each patch into one vector: (B, N, C*p*p)
         x = x.reshape(B, self.num_patches, C * p * p)
+        # project each patch vector to token: (B, N, d_model)
         x = self.linear_proj(x)
         return x
 
@@ -127,13 +136,20 @@ class ResidualBlock(nn.Module):
     """
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
+
+        # two 3x3 convolutions with batch normalization
+        # conv1 carries stride, so it downsamples when stride > 1
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
                                stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
                                padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
+        # activation function
         self.relu = nn.ReLU()
+
+        # shortcut path to add block's input to output
+        # 1x1 conv (with matching stride) + BN projects the input to match output shape
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1,
@@ -141,6 +157,7 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels)
             )
         else:
+            # identity when shapes match
             self.shortcut = nn.Identity()
 
     def forward(self, x):
@@ -187,21 +204,30 @@ class ResNetTokenizer(nn.Module):
 
     def __init__(self, d_model, img_size, n_channels, blocks_per_stage=9):
         super().__init__()
+
+        # image size must be divisible by downsampling rate
         if img_size % self.DOWNSAMPLE != 0:
             raise ValueError(f"{img_size} not divisible by {self.DOWNSAMPLE}")
         if blocks_per_stage < 1:
             raise ValueError(f"blocks_per_stage {blocks_per_stage} < 1")
+
+        # two stages of stride=2 shrink each side by 4
         self.num_patches = (img_size // self.DOWNSAMPLE) ** 2
+        # stem 3x3 conv lifts RGB to 16 feature channels, keeping full resolution
         self.stem = nn.Sequential(
             nn.Conv2d(n_channels, 16, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU()
         )
         self.stages = nn.Sequential(
+            # stage 1: full resolution, 16 channels
             self._make_stage(16, 16, blocks_per_stage, 1),
+            # stages 2 and 3: first block halves image resolution (stride 2)
+            # and doubles channels
             self._make_stage(16, 32, blocks_per_stage, 2),
             self._make_stage(32, 64, blocks_per_stage, 2)
         )
+        # turn 64 feature channels into d_model-dimensional tokens
         self.proj = nn.Conv2d(64, d_model, kernel_size=1)
 
     @staticmethod
@@ -221,7 +247,9 @@ class ResNetTokenizer(nn.Module):
         Returns:
             nn.Sequential: The stage.
         """
+        # first block applies stride and changes channels
         blocks = [ResidualBlock(in_channels, out_channels, stride)]
+        # remaining blocks keep resolution
         blocks += [ResidualBlock(out_channels, out_channels)
                    for _ in range(n_blocks - 1)]
         return nn.Sequential(*blocks)
@@ -240,7 +268,10 @@ class ResNetTokenizer(nn.Module):
         x = self.stem(x)
         x = self.stages(x)
         x = self.proj(x)
+        # projection output shape is (B, d_model, 8, 8);
+        # merge 8x8 grid into one axis of 64 positions: (B, d_model, 64)
         x = x.flatten(2)
+        # swap axes so each of the 64 positions is a row: (B, 64, d_model)
         x = x.transpose(1, 2)
         return x
 
@@ -251,7 +282,8 @@ class MultiHeadSelfAttention(nn.Module):
 
     Projects each token to queries, keys, and values, computes attention
     independently in each head, then concatenates the heads and applies an
-    output projection.
+    output projection. An optional additive bias on the attention scores
+    supports relative position biases and masks (used by WindowAttention).
 
     Args:
         d_model (int): Embedding dimension of each token.
@@ -263,36 +295,65 @@ class MultiHeadSelfAttention(nn.Module):
     """
     def __init__(self, d_model, n_heads, dropout=0.0):
         super().__init__()
+
+        # each head must get an equal slice of the d_model-dimensional vector
         if d_model % n_heads != 0:
             raise ValueError(f"{d_model} is not divisible by {n_heads}!")
+
+        # number of dimensions per head
         self.head_dim = d_model // n_heads
+        # scale by 1/sqrt(head_dim) so that q * k dot products do not saturate softmax
         self.scale = self.head_dim ** -0.5
         self.n_heads = n_heads
+        # one linear layer projects each token to its query, key, and value (3 x d_model)
         self.qkv = nn.Linear(d_model, 3 * d_model)
+        # output projection that mixes the concatenated heads back into d_model
         self.proj = nn.Linear(d_model, d_model)
+        # dropout on attention weights
         self.attn_dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, bias=None):
         """
         Apply self-attention across the tokens of each image.
 
         Args:
             x (torch.Tensor): Tokens of shape (B, N, d_model).
+            bias (torch.Tensor, optional): Added to the attention scores
+                before the softmax; must broadcast to (B, n_heads, N, N),
+                e.g. shape (n_heads, N, N). Defaults to None (no bias).
 
         Returns:
             torch.Tensor: Attention output of shape (B, N, d_model).
         """
+
+        # batch size, number of tokens, d_model
         B, N, D = x.shape
+        # get stacked query, key, and value vectors: (B, N, 3*d_model)
         x = self.qkv(x)
+        # reshape to split 3*d_model into which of query/key/value,
+        # which head, and dimension within head
         x = x.reshape(B, N, 3, self.n_heads, self.head_dim)
+        # rearrange so that qkv is in front and n_heads next to batch:
+        # (3, B, n_heads, N, head_dim)
         x = x.permute(2, 0, 3, 1, 4)
+        # split along qkv into 3 tensors of shape (B, n_heads, N, head_dim)
         q, k, v = x.unbind(0)
+        # compute scaled dot-product attention scores (B, n_heads, N, N)
         scores = q @ k.transpose(-2, -1) * self.scale
+        # optional additive bias for Swin's position bias / shift mask
+        if bias is not None:
+            scores = scores + bias
+        # softmax over keys so that each query's attention weights sum to one
         weights = scores.softmax(dim=-1)
+        # randomly zero attention weights
         weights = self.attn_dropout(weights)
+        # weighted sum of values for each query: (B, n_heads, N, head_dim)
         attn_out = weights @ v
+        # move n_heads next to head_dim: (B, N, n_heads, head_dim)
         attn_out = attn_out.transpose(1, 2)
+        # concatenate the heads back into d_model: (B, N, D)
         attn_out = attn_out.reshape(B, N, D)
+        # output projection mixes information across heads
         attn_out = self.proj(attn_out)
         return attn_out
 
@@ -311,6 +372,9 @@ class MLP(nn.Module):
     """
     def __init__(self, d_model, mlp_ratio=4, dropout=0.0):
         super().__init__()
+
+        # feed-forward network applied to each token independently; expands to
+        # mlp_ratio*d_model, applies GELU, and projects back to d_model
         self.fc1 = nn.Linear(d_model, int(mlp_ratio * d_model))
         self.act = nn.GELU()
         self.fc2 = nn.Linear(int(mlp_ratio * d_model), d_model)
@@ -351,6 +415,7 @@ class DropPath(nn.Module):
     """
     def __init__(self, p=0.0):
         super().__init__()
+
         if p >= 1 or p < 0:
             raise ValueError(f"p {p} not in [0,1)")
         self.p = p
@@ -365,11 +430,15 @@ class DropPath(nn.Module):
         Returns:
             torch.Tensor: Tensor of the same shape as ``x``.
         """
+        # identity during eval or when drop rate is 0
         if not self.training or self.p == 0.0:
             return x
         keep = 1 - self.p
+        # keeps batch axis at full size while making every other axis size 1: (B, 1, ..., 1)
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        # fills tensor of that shape with 1 with probability of keep and 0 otherwise
         mask = x.new_empty(shape).bernoulli_(keep)
+        # zero out dropped samples and scale the rest so that average output equals input
         return x * mask / keep
 
 
@@ -388,10 +457,13 @@ class TransformerBlock(nn.Module):
     """
     def __init__(self, config, drop_path=0.0):
         super().__init__()
+
+        # pre-norm block: layer normalization before each sublayer
         self.norm1 = nn.LayerNorm(config.d_model)
         self.attn = MultiHeadSelfAttention(config.d_model, config.n_heads, config.dropout)
         self.norm2 = nn.LayerNorm(config.d_model)
         self.mlp = MLP(config.d_model, config.mlp_ratio, config.dropout)
+        # DropPath on each residual branch; each module call draws its own mask
         self.drop_path = DropPath(drop_path)
 
     def forward(self, x):
@@ -404,9 +476,36 @@ class TransformerBlock(nn.Module):
         Returns:
             torch.Tensor: Tokens of shape (B, N, d_model).
         """
+        # pre-norm: normalizing only each branch's input keeps the residual path a clean
+        # identity to help train more stably than normalizing after residual add
         x = x + self.drop_path(self.attn(self.norm1(x)))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
+
+
+def init_weights(module):
+    """
+    Initialize one submodule's weights; shared by ViT and Swin.
+
+    Applied to every submodule with ``model.apply(init_weights)``. Linear
+    layers get truncated-normal weights (std 0.02) and zero biases (layers
+    without a bias, such as PatchMerging's reduction, are skipped); LayerNorms
+    get unit weights and zero biases. Other modules keep PyTorch's defaults,
+    including the ResNet tokenizer's convolutions (Kaiming initialization)
+    and batch norms. Parameters that are not modules, the ViT position
+    embedding and the Swin relative position bias tables, are initialized
+    where they are created.
+
+    Args:
+        module (nn.Module): The submodule to initialize.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(module.bias)
 
 
 class ViT(nn.Module):
@@ -430,45 +529,35 @@ class ViT(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
+
+        # plain ViT: non-overlapping 4x4 patches, each linearly projected to a token
         if config.tokenizer == "patch":
             self.tokenizer = PatchEmbedding(config.d_model, config.img_size,
                                             config.patch_size, config.n_channels)
+        # hybrid: ResNet-56 feature map, each 8x8 position projected to a token
         elif config.tokenizer == "resnet":
             self.tokenizer = ResNetTokenizer(config.d_model, config.img_size,
                                              config.n_channels, config.blocks_per_stage)
         else:
             raise ValueError(f"Unknown tokenizer: {config.tokenizer}")
+
+        # learned position embedding, one vector per token position: (1, N, d_model)
         self.pos_embed = nn.Parameter(
             torch.zeros(1, self.tokenizer.num_patches, config.d_model))
+        # populate with values drawn from a truncated normal distribution with std 0.02
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # drop-path rate rises linearly from 0 (first block) to drop_path_rate (last block)
         rates = torch.linspace(0, config.drop_path_rate, config.depth).tolist()
+        # create transformer blocks with drop-path rates
         self.blocks = nn.Sequential(*[
             TransformerBlock(config, drop_path=rate)
             for rate in rates])
+        # pre-norm leaves the residual stream unnormalized so a final LayerNorm is required
         self.norm = nn.LayerNorm(config.d_model)
+        # classifier on the mean-pooled tokens
         self.head = nn.Linear(config.d_model, config.num_classes)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        """
-        Initialize a submodule's weights; called on every submodule by ``apply``.
-
-        Linear layers get truncated-normal weights (std 0.02) and zero biases;
-        LayerNorms get unit weights and zero biases. Convolutions and batch
-        norms in the ResNet tokenizer keep PyTorch's defaults (Kaiming
-        initialization for convolutions). The position embedding is a
-        parameter, not a module, so it is initialized separately.
-
-        Args:
-            module (nn.Module): The submodule to initialize.
-        """
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+        # initialize every Linear and LayerNorm in the model
+        self.apply(init_weights)
 
     def forward(self, x):
         """

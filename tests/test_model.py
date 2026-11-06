@@ -1,14 +1,17 @@
 """
-Tests for the ViT and hybrid models.
+Tests for the ViT, hybrid, and Swin models.
 
-Verifies output and token shapes for both tokenizers, exact parameter counts
-and that the two models are matched in size, and that invalid inputs and
-configurations raise ``ValueError``.
+Verifies output and token shapes, exact parameter counts and that the plain
+ViT and the Swin are each within 10% of the hybrid's size, that invalid
+inputs and configurations raise ``ValueError``, and the Swin's windowing:
+the window partition round trip and the pattern of shifted blocks.
 """
 
 import pytest
 import torch
-from src.models import ViT, ViTConfig, PatchEmbedding, ResNetTokenizer, MultiHeadSelfAttention
+from src.models import (ViT, ViTConfig, PatchEmbedding, ResNetTokenizer,
+                        MultiHeadSelfAttention, Swin, SwinConfig, SwinBlock,
+                        window_partition, window_reverse)
 
 
 def _count_params(model):
@@ -76,20 +79,23 @@ def test_parameter_count(tokenizer, depth, expected):
     assert count == expected, count_message
 
 
-def test_models_similar_size():
+@pytest.mark.parametrize("make_model", [
+    pytest.param(lambda: ViT(ViTConfig(tokenizer="patch", depth=9)), id="vit"),
+    pytest.param(lambda: Swin(SwinConfig()), id="swin")
+])
+def test_models_similar_size(make_model):
     """
-    Check that the plain ViT is within 10% of the hybrid's parameter count.
+    Check that a comparison model is within 10% of the hybrid's parameter count.
 
-    The assignment requires the baseline's trainable parameter count to be
-    within 10% of the primary (hybrid) model's, so accuracy differences
-    reflect architecture rather than model capacity. Uses the depths the two
-    models are trained with (ViT 9, hybrid 7).
+    The assignment requires each comparison model's trainable parameter
+    count to be within 10% of the primary (hybrid) model's, so accuracy
+    differences reflect architecture rather than model capacity. Uses the
+    configurations the models are trained with (hybrid depth 7, plain ViT
+    depth 9, Swin defaults).
     """
-    model_vit = ViT(ViTConfig(tokenizer="patch", depth=9))
-    model_hybrid = ViT(ViTConfig(tokenizer="resnet", depth=7))
-    vit_count = _count_params(model_vit)
-    hybrid_count = _count_params(model_hybrid)
-    diff = abs(hybrid_count - vit_count) / hybrid_count
+    hybrid_count = _count_params(ViT(ViTConfig(tokenizer="resnet", depth=7)))
+    count = _count_params(make_model())
+    diff = abs(hybrid_count - count) / hybrid_count
     similar_message = f"Model sizes not close, differ by {diff:.1%}"
     assert diff < 0.10, similar_message
 
@@ -112,3 +118,62 @@ def test_invalid_inputs(make_invalid):
     """
     with pytest.raises(ValueError):
         make_invalid()
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+def test_swin_shape(batch_size):
+    """
+    Check that the Swin maps a batch of images to (batch_size, 100) logits.
+
+    Batch size 1 matters especially for Swin: ``window_reverse`` and the
+    shift mask's per-image copy both infer the batch size from the number
+    of windows.
+    """
+    model = Swin(SwinConfig())
+    model.eval()
+    x = torch.randn(batch_size, 3, 32, 32)
+    with torch.no_grad():
+        out = model(x)
+    shape_message = f"Expected shape {(batch_size, 100)} got {out.shape}"
+    assert out.shape == (batch_size, 100), shape_message
+
+
+def test_swin_param_count():
+    """
+    Check the exact trainable parameter count of the Swin as trained.
+
+    With the default config (depth (2, 4, 4)): patch embedding (832), two
+    stage-1 blocks (50,082 each), merge to 128 channels (33,280), four
+    stage-2 blocks (198,468 each), merge to 256 channels (132,096), four
+    stage-3 blocks (790,152 each), final norm (512), and head (25,700).
+    Each block includes its relative position bias table.
+    """
+    count = _count_params(Swin(SwinConfig()))
+    assert count == 4_247_064, f"Expected 4,247,064, got {count}"
+
+
+def test_shift_pattern():
+    """
+    Check which Swin blocks use shifted windows, and by how much.
+
+    Stages 1 and 2 alternate regular (0) and shifted (window_size // 2 = 2)
+    windows. Stage 3's 4x4 grid is a single window, so none of its blocks
+    shift.
+    """
+    model = Swin(SwinConfig())
+    truth = [0, 2, 0, 2, 0, 2, 0, 0, 0, 0]
+    shifts = [b.shift for b in model.stages if isinstance(b, SwinBlock)]
+    assert shifts == truth, f"Expected shifts {truth} got {shifts}"
+
+
+def test_window_round_trip():
+    """
+    Check that window_reverse exactly undoes window_partition.
+
+    Uses ``torch.equal`` rather than a tolerance, since partitioning only
+    moves values. The shift mask and the window attention depend on this
+    window order.
+    """
+    x = torch.randn(2, 16, 16, 8)
+    out = window_reverse(window_partition(x, 4), 4, 16, 16)
+    assert torch.equal(out, x), "window_reverse did not restore the input"

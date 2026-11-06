@@ -1,12 +1,12 @@
 """
-Train a ViT or hybrid ViT on CIFAR-100 from scratch.
+Train a ViT, hybrid ViT, or Swin on CIFAR-100 from scratch.
 
 Builds the stratified train/validation split and the test set, constructs the
-model selected by --tokenizer ("patch" for the plain ViT, "resnet" for the
-hybrid), and trains it with AdamW (weight decay on weights only), linear
-warmup then cosine decay stepped per batch, MixUp/CutMix, label smoothing,
-stochastic depth, gradient clipping, and optional mixed precision. Each epoch
-logs train and validation metrics to Weights & Biases, saves the weights with
+model selected by --arch ("vit" or "swin") and, for ViTs only, --tokenizer
+("patch" for the plain ViT, "resnet" for the hybrid). Trains it with AdamW (weight
+decay on weights only), linear warmup then cosine decay stepped per batch, MixUp/CutMix,
+label smoothing, stochastic depth, gradient clipping, and optional mixed precision.
+Each epoch logs train and validation metrics to Weights & Biases, saves the weights with
 lowest validation loss to best.pt and a full resume checkpoint to last.pt, and
 stops early after --early_stop_patience epochs without validation-loss improvement.
 An interrupted run continues from last.pt with --resume. The test set is
@@ -32,7 +32,7 @@ import wandb
 from tqdm import tqdm
 
 from src.data import build_datasets, DEFAULT_SEED, build_mix
-from src.models import ViT, ViTConfig
+from src.build import build_model
 
 
 WANDB_PROJECT = "Image_Classification_Transformers"
@@ -69,9 +69,11 @@ def parse_args():
     parser.add_argument('--run_seed', type=int, default=DEFAULT_SEED,
                         help='Seed for random and torch for reproducible output')
     parser.add_argument('--tokenizer', choices=['patch', 'resnet'], default='patch',
-                        help='Whether to use patches (ViT) or ResNet tokenizer (Hybrid)')
+                        help='ViT only: patch embedding (plain ViT) or ResNet tokenizer (hybrid)')
+    parser.add_argument('--arch', choices=['vit', 'swin'], default='vit',
+                        help='Model architecture to train: ViT or Swin')
     parser.add_argument('--depth', type=int, default=7,
-                        help='Number of transformer encoder blocks')
+                        help='ViT only: Number of transformer encoder blocks')
     parser.add_argument('--drop_path_rate', type=float, default=0.1,
                         help='Stochastic depth drop rate for transformer blocks')
     parser.add_argument('--mixup_alpha', type=float, default=0.8,
@@ -287,9 +289,9 @@ def build_optimizer(model, args):
     """
     Build AdamW with weight decay applied to weights only.
 
-    Parameters with fewer than two dimensions (biases and normalization
-    weights) and the position embedding are excluded from weight decay, as in
-    standard ViT training recipes.
+    Parameters with fewer than two dimensions (biases and normalization weights)
+    and the position embedding (ViT's pos_embed and Swin's relative position bias tables)
+    are excluded from weight decay, as in standard ViT or Swin training recipes.
 
     Args:
         model (nn.Module): The model to optimize.
@@ -301,7 +303,7 @@ def build_optimizer(model, args):
     decay = []
     no_decay = []
     for name, param in model.named_parameters():
-        if param.ndim < 2 or name == "pos_embed":
+        if param.ndim < 2 or name == "pos_embed" or "rel_pos_bias" in name:
             no_decay.append(param)
         else:
             decay.append(param)
@@ -612,8 +614,7 @@ def main(args):
     datasets = build_datasets(args.data_dir, DEFAULT_SEED)
     dataloaders = build_loaders(datasets[0], datasets[1], datasets[2],
                                 args.batch_size, args.num_workers)
-    model = ViT(ViTConfig(tokenizer=args.tokenizer, depth=args.depth,
-                          drop_path_rate=args.drop_path_rate)).to(device)
+    model = build_model(vars(args)).to(device)
     init_wandb(args, run_id)
     components, amp_dtype = build_components(model, args, device, len(dataloaders[0]))
     state = load_checkpoint(ckpt, model, components) if ckpt else TrainState()
