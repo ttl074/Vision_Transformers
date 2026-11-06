@@ -9,9 +9,8 @@ the window partition round trip and the pattern of shifted blocks.
 
 import pytest
 import torch
-from src.models import (ViT, ViTConfig, PatchEmbedding, ResNetTokenizer,
-                        MultiHeadSelfAttention, Swin, SwinConfig, SwinBlock,
-                        window_partition, window_reverse)
+from src.models import ViT, ViTConfig, PatchEmbedding, ResNetTokenizer, MultiHeadSelfAttention
+from src.swin import Swin, SwinConfig, SwinBlock, window_partition, window_reverse
 
 
 def _count_params(model):

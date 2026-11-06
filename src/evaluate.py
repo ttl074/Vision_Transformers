@@ -48,7 +48,7 @@ def load_model(ckpt_path, device):
             - val_loss (float): Validation loss at that epoch.
     """
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = build_model(ckpt["run_info"].to(device))
+    model = build_model(ckpt["run_info"]).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt["epoch"], ckpt["val_loss"]
