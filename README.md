@@ -8,11 +8,17 @@ Three transformer image classifiers trained from scratch on CIFAR-100 at its nat
 | Plain ViT (baseline) | 4 × 4 patch embedding + 9 transformer blocks | 4,799,076 | 71.52% | 0.7135 |
 | Swin | Scaled-down Swin Transformer, 4 × 4 shifted windows | 4,247,064 | 70.74% | 0.7050 |
 
-The full write-up is in `experiments.pdf`.
+The full report, *Image Classification with Vision Transformers: An Experimental Study*, is in `experiments.pdf`.
 
 ## Repository layout
 
 ```
+vision_transformer/
+README.md       this file
+requirements.txt pinned dependencies
+experiments.pdf the report
+pytest.ini      pytest settings (adds the repository root to the import path)
+.pylintrc       pylint settings
 src/            model, data, training, evaluation, and plotting code
   models.py     plain ViT and ResNet-Transformer hybrid
   swin.py       Swin Transformer
@@ -22,11 +28,12 @@ src/            model, data, training, evaluation, and plotting code
   evaluate.py   test-set evaluation and error analysis
   plot_curves.py training-curve and learning-rate figures
 scripts/        train.sh and evaluate.sh
-tests/          pytest tests for the data split and models
+tests/          pytest tests: split disjointness and duplicate handling, output and token
+                shapes, parameter counts, invalid inputs, and Swin windowing
 logs/           training logs, test metrics, and test predictions
 figures/        all figures in the report
-configs/        run configurations
 stats.ipynb     duplicate check, parameter counts, McNemar tests
+pylint_screenshot.png, pynblint_screenshot.png  linter results
 ```
 
 ## Environment setup
@@ -38,7 +45,7 @@ On Colab, mount Google Drive and move into the repository:
 ```python
 from google.colab import drive
 drive.mount("/content/drive")
-%cd /content/drive/MyDrive/<path to>/Vision_Transformers
+%cd /content/drive/MyDrive/<path to>/vision_transformer
 ```
 
 Locally, create a virtual environment first:
@@ -74,7 +81,7 @@ The 50,000 training images are split into 45,000 training and 5,000 validation i
 
 ## Training
 
-`scripts/train.sh` sets the architecture, depth, run name, and seed for each model. All other settings are the defaults in `src/train.py` (batch size 128, AdamW with learning rate 5e-4 and weight decay 0.05, 10 warmup epochs then cosine decay, up to 200 epochs with early stopping after 30 epochs without validation-loss improvement, label smoothing 0.1, drop path 0.1, MixUp/CutMix, and mixed precision).
+There are no separate configuration files: each model is configured with command-line arguments. `scripts/train.sh` sets the architecture, depth, run name, and seed for each model, and `python -m src.train --help` lists every argument and its default. All other settings are the defaults in `src/train.py` (batch size 128, AdamW with learning rate 5e-4 and weight decay 0.05, 10 warmup epochs then cosine decay, up to 200 epochs with early stopping after 30 epochs without validation-loss improvement, label smoothing 0.1, drop path 0.1, MixUp/CutMix, and mixed precision).
 
 Train the primary model (ResNet-Transformer hybrid):
 
@@ -134,12 +141,23 @@ The model architecture is rebuilt from the settings stored in the checkpoint, so
 
 Steps 3 and 4 only need the files already in `logs/`, so they can be rerun without retraining.
 
-Run the tests and linter with:
+## Tests and code quality
+
+Run the tests and linters from the repository root:
 
 ```bash
-pytest
-pylint src tests
+pytest                      # tests in tests/
+pylint src tests            # Python code, using the settings in .pylintrc
+pynblint stats.ipynb        # notebook linter (pip install pynblint; not pinned in requirements.txt)
 ```
+
+Pylint scores 10.00/10:
+
+![Pylint result](pylint_screenshot.png)
+
+Pynblint scores 10/10 for `stats.ipynb`:
+
+![Pynblint result](pynblint_screenshot.png)
 
 ## Where logs and outputs are saved
 

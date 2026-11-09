@@ -1,5 +1,5 @@
 """
-Evaluate a trained ViT or hybrid ViT on the CIFAR-100 test set.
+Evaluate a trained ViT, hybrid ViT, or Swin on the CIFAR-100 test set.
 
 Loads a best.pt checkpoint written by src.train, rebuilds the model from the
 run settings stored in it, and evaluates the official 10,000-image test set
@@ -34,8 +34,8 @@ def load_model(ckpt_path, device):
     """
     Rebuild a trained model from a best.pt checkpoint, ready for inference.
 
-    The tokenizer and depth come from the run settings saved in the
-    checkpoint, so the architecture matches the one that was trained.
+    The architecture and its settings come from the run settings saved in
+    the checkpoint, so the model matches the one that was trained.
 
     Args:
         ckpt_path (str): Path to best.pt.
@@ -43,7 +43,7 @@ def load_model(ckpt_path, device):
 
     Returns:
         tuple: (model, epoch, val_loss):
-            - model (ViT): The trained model, in eval mode.
+            - model (nn.Module): The trained model, in eval mode.
             - epoch (int): Epoch at which the checkpoint was saved.
             - val_loss (float): Validation loss at that epoch.
     """
